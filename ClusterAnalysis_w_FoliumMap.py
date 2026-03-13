@@ -460,6 +460,134 @@ def find_clusters_window4(
     labeled_array[labeled_array == 0 ] = -9999
     return labeled_array, cluster_info
 
+def developMap_fromArray(
+    data,
+    transform,
+    crs,
+    nodata=-9999,                     # default as requested
+    png_path_cluster="output/overlay_3857.png",
+    html_path="output/cluster_map_overlay_3857.html",
+    class_colors=None,                # {class_value: (R,G,B)}, 0-255; nodata is ignored
+    fallback_cmap="tab20",            # used for any classes not in class_colors
+    zoom_start=4
+):
+    """
+    Reproject a *classified* raster array to EPSG:3857 (nearest-neighbor),
+    render by class while masking NoData (-9999 by default) so it is not
+    displayed at all (transparent in the PNG), and create a Folium overlay.
+    """
+
+    # --- Normalize input to one band ---
+    if data.ndim == 3:
+        band = data[..., 0]
+    elif data.ndim == 2:
+        band = data
+    else:
+        raise ValueError("`data` must be 2D (rows, cols) or 3D (rows, cols, bands).")
+
+    band = np.asarray(band)
+
+    # --- 1) Reproject to Web Mercator (EPSG:3857) using NEAREST ---
+    dst_crs = "EPSG:3857"
+    rows, cols = band.shape
+    left, bottom, right, top = array_bounds(rows, cols, transform)
+
+    dst_transform, dst_w, dst_h = calculate_default_transform(
+        crs, dst_crs, cols, rows, left, bottom, right, top
+    )
+
+    # Use NaN as destination NoData to make masking unambiguous
+    data_3857 = np.full((dst_h, dst_w), np.nan, dtype=np.float32)
+
+    reproject(
+        source=band.astype(np.float32, copy=False),
+        destination=data_3857,
+        src_transform=transform,
+        src_crs=crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.nearest,
+        src_nodata=nodata,
+        dst_nodata=np.nan,
+    )
+
+    # --- 2) Compute geographic bounds for Folium overlay ---
+    left_m, bottom_m, right_m, top_m = array_bounds(data_3857.shape[0], data_3857.shape[1], dst_transform)
+    (sw_lon,), (sw_lat,) = rio_transform(dst_crs, "EPSG:4326", [left_m],  [bottom_m])
+    (ne_lon,), (ne_lat,) = rio_transform(dst_crs, "EPSG:4326", [right_m], [top_m])
+    folium_bounds = [[sw_lat, sw_lon], [ne_lat, ne_lon]]
+
+    # --- 3) Strict masking of NoData and class color rendering ---
+    arr = data_3857  # float32 with NaN representing NoData
+    mask = ~np.isfinite(arr)          # True where NoData
+
+    # Build the output RGBA; start fully transparent everywhere
+    rgba = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.uint8)
+
+    # Work only on valid pixels (non-NoData)
+    valid = ~mask
+    if np.any(valid):
+        # Recover class codes (integers) after reprojection
+        classes_present = np.unique(np.round(arr[valid]).astype(np.int64))
+
+        # Prepare color map
+        if class_colors is None:
+            # Assign stable colors from a qualitative colormap
+            mpl_cmap = cm.get_cmap(fallback_cmap, max(len(classes_present), 1))
+            color_map = {
+                int(cls): tuple(int(c * 255) for c in mpl_cmap(i % mpl_cmap.N)[:3])
+                for i, cls in enumerate(classes_present)
+            }
+        else:
+            # Normalize keys to int and ensure RGB tuples
+            color_map = {int(k): tuple(v) for k, v in class_colors.items()}
+            # Assign fallback colors to any classes not covered
+            missing = [int(c) for c in classes_present if int(c) not in color_map]
+            if missing:
+                mpl_cmap = cm.get_cmap(fallback_cmap, max(len(missing), 1))
+                for i, cls in enumerate(missing):
+                    color_map[cls] = tuple(int(c * 255) for c in mpl_cmap(i % mpl_cmap.N)[:3])
+
+        # Paint valid pixels: look up per-pixel class color
+        cls_codes = np.round(arr[valid]).astype(np.int64)
+        rgb = np.zeros((cls_codes.size, 3), dtype=np.uint8)
+        for idx, cls in enumerate(cls_codes):
+            rgb[idx] = color_map[int(cls)]
+        rgba[valid, :3] = rgb
+        rgba[valid, 3] = 255  # opaque for valid pixels
+
+        # Note: nodata pixels remain alpha=0 (not shown at all)
+        classes_list = classes_present.tolist()
+    else:
+        # No valid pixels; keep a fully transparent image
+        color_map = {}
+        classes_list = []
+
+    # Write PNG (NoData is fully transparent)
+    Image.fromarray(rgba, mode="RGBA").save(png_path_cluster)
+
+    # --- 4) Folium overlay ---
+    center = [(sw_lat + ne_lat) / 2, (sw_lon + ne_lon) / 2]
+    m = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
+    folium.raster_layers.ImageOverlay(
+        image=png_path_cluster,
+        bounds=folium_bounds,
+        opacity=1.0,                 # full opacity; transparency is per-pixel via alpha
+        interactive=True,
+    ).add_to(m)
+    folium.LayerControl().add_to(m)
+    m.save(html_path)
+
+    # Build return info (NoData not included)
+    legend = {int(k): (*v, 255) for k, v in color_map.items()}  # RGBA with full opacity
+
+    print(f"Saved {html_path} and {png_path}")
+    return {
+        "dst_crs": dst_crs,
+        "dst_transform": dst_transform,
+        "classes": classes_list,     # NoData not included
+        "color_map": legend          # No NoData entry here either
+    }
 
 def developMap(bil_path,
                png_path,
@@ -557,23 +685,23 @@ def developMap(bil_path,
 
     # --- 4) Folium overlay using lat/lon bounds of the Mercator image ---
     center = [(sw_lat + ne_lat) / 2, (sw_lon + ne_lon) / 2]
-    # m = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
-    # folium.raster_layers.ImageOverlay(
-    #     image=png_path,
-    #     bounds=folium_bounds,     # SW/NE of the Mercator-projected image
-    #     opacity=0.7,
-    #     interactive=True
-    # ).add_to(m)
-    # folium.LayerControl().add_to(m)
-    # m.save(html_path)
-    # print(f"Saved {html_path} and {png_path}")
+    m = folium.Map(location=center, zoom_start=zoom_start, tiles="CartoDB positron")
+    folium.raster_layers.ImageOverlay(
+        image=png_path,
+        bounds=folium_bounds,     # SW/NE of the Mercator-projected image
+        opacity=0.7,
+        interactive=True
+    ).add_to(m)
+    folium.LayerControl().add_to(m)
+    m.save(html_path)
+    print(f"Saved {html_path} and {png_path}")
 
     return src_crs, src_transform, center, folium_bounds
 
 bil_path = "/nfs/pancake/prism_current/us/an/ehdr/800m/tmax/daily/2026/prism_tmax_us_30s_20260115.bil"          # <- your .bil
 bil_path_out = "output/clusters.bil"  
 png_path = "output/elevation_overlay.png" 
-png_path_cluster = "output/cluster_overlay.png" 
+png_path_cluster = "output/overlay_3857.png"
 
 nor_path="/nfs/pancake/prism_current/us/an/ehdr/800m/tmax/daily/normals/prism_tmax_us_30s_20200115_avg_30y.bil"    
 hdr_path="/nfs/pancake/prism_current/us/an/ehdr/800m/tmax/daily/2026/prism_tmax_us_30s_20260115.hdr"
@@ -613,7 +741,20 @@ labels, clusters = find_clusters_window4(
 crs, transform, center , folium_bounds = developMap(bil_path,png_path)
 
 #Develop a map overlay of the clusters using the original BIL for georeferencing and the labels for rendering. 
+result = developMap_fromArray(
+    data=labels,                 # can pass the 3D array; function will pick band 1
+    transform=transform,
+    crs=crs,
+    nodata=-9999,
+    png_path_cluster="output/overlay_3857.png",
+    html_path="output/overlay_map.html",
+   # cmap_name="terrain",
 
+    class_colors=None,        # or None to auto-assign
+    fallback_cmap="tab20",
+    
+    zoom_start=6
+)
 
 m = folium.Map(location=center, zoom_start=4, tiles="CartoDB positron")
 folium.raster_layers.ImageOverlay(
@@ -624,7 +765,6 @@ folium.raster_layers.ImageOverlay(
     interactive=True
 ).add_to(m)
 #folium.LayerControl().add_to(m)
-
 
 
 # Second overlay (same image, different name)
