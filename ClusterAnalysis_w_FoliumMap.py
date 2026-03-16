@@ -1,9 +1,17 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# ClusterAnalysis_w_FoliumMap
 """
 Created on Fri Jan 23 14:36:01 2026
 @author: vachek
 """
+
+# #!/usr/bin/env python3
+# # -*- coding: utf-8 -*-
+
+# Conda environment created with:
+#   /nfs/pancake/u5/projects/solar_radiation/anaconda3/bin/conda create --name automateQC Tule1 python=3.14
+# To activated environment and run code via terminal:
+#   source /nfs/pancake/u5/projects/solar_radiation/anaconda3/bin/activate automateQC
+#   cd /nfs/pancake/u5/projects/ruppd/automate_qc
 
 
 import numpy as np
